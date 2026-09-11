@@ -48,7 +48,7 @@ PLAYLIST_MEDIA_TYPES: Final[tuple[MediaType, ...]] = (
 
 # API_SCHEMA_VERSION: bump this when adding new features to the API commands (and models)
 # or small non-breaking changes to existing commands
-API_SCHEMA_VERSION: Final[int] = 43
+API_SCHEMA_VERSION: Final[int] = 70
 
 # MIN_SCHEMA_VERSION is the minimum API schema version that the current server
 # version can work with. Only bump when there are breaking changes to existing
@@ -99,6 +99,8 @@ CONF_SERVER_ID: Final[str] = "server_id"
 CONF_ENCRYPTION_KEY: Final[str] = "encryption_key"
 CONF_ENCRYPTION_KEY_MIGRATED: Final[str] = "encryption_key_migrated"
 CONF_NFS_SUBFOLDER_MIGRATED: Final[str] = "nfs_subfolder_migrated"
+CONF_RETIRED_LOCAL_AUDIO_CLEANED: Final[str] = "retired_local_audio_cleaned"
+CONF_PROVIDER_ACCESS_MIGRATED: Final[str] = "provider_access_migrated"
 CONF_IP_ADDRESS: Final[str] = "ip_address"
 CONF_PORT: Final[str] = "port"
 CONF_PROVIDERS: Final[str] = "providers"
@@ -144,6 +146,7 @@ CONF_ANNOUNCE_VOLUME: Final[str] = "announce_volume"
 CONF_ANNOUNCE_VOLUME_MIN: Final[str] = "announce_volume_min"
 CONF_ANNOUNCE_VOLUME_MAX: Final[str] = "announce_volume_max"
 CONF_PRE_ANNOUNCE_CHIME_URL: Final[str] = "pre_announcement_chime_url"
+CONF_ANNOUNCE_TTS_ENGINE: Final[str] = "announce_tts_engine"
 CONF_ICON: Final[str] = "icon"
 CONF_LANGUAGE: Final[str] = "language"
 CONF_SAMPLE_RATES: Final[str] = "sample_rates"
@@ -156,6 +159,7 @@ CONF_VOLUME_NORMALIZATION_FIXED_GAIN_RADIO: Final[str] = "volume_normalization_f
 CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS: Final[str] = "volume_normalization_fixed_gain_tracks"
 CONF_POWER_CONTROL: Final[str] = "power_control"
 CONF_VOLUME_CONTROL: Final[str] = "volume_control"
+CONF_VOLUME_STEP: Final[str] = "volume_step"
 CONF_MUTE_CONTROL: Final[str] = "mute_control"
 CONF_MIN_VOLUME: Final[str] = "min_volume"
 CONF_MAX_VOLUME: Final[str] = "max_volume"
@@ -167,9 +171,14 @@ CONF_PROTOCOL_PARENT_ID: Final[str] = (
 CONF_UNDERLYING_PLAYER_ID: Final[str] = (
     "underlying_player_id"  # player this (bridge) protocol player is derived from
 )
+# Translation key of the warning a provider stores on a protocol player it considers
+# experimental. Its presence also makes the output's enable entry default to disabled;
+# a stored enabled state still wins, so the provider persists that one itself.
+CONF_PROTOCOL_EXPERIMENTAL_NOTE: Final[str] = "protocol_experimental_note"
 CONF_CACHED_ARP_MAC: Final[str] = "cached_arp_mac"  # cached ARP-resolved MAC for fast restart
 CONF_REPORTED_MAC: Final[str] = "reported_mac"  # original MAC reported by provider (before ARP)
 CONF_OUTPUT_CODEC: Final[str] = "output_codec"
+CONF_PREFER_WAV_FOR_LIVE_SOURCES: Final[str] = "prefer_wav_for_live_sources"
 CONF_ALLOW_AUDIO_CACHE: Final[str] = "allow_audio_cache"
 CONF_SMART_FADES_MODE: Final[str] = "smart_fades_mode"  # legacy; consumed by one-time migration
 CONF_CROSSFADE_MODE: Final[str] = "crossfade_mode"
@@ -182,6 +191,7 @@ CONF_ZEROCONF_INTERFACES: Final[str] = "zeroconf_interfaces"
 CONF_ENABLED: Final[str] = "enabled"
 CONF_PROTOCOL_KEY_SPLITTER: Final[str] = "||protocol||"
 CONF_PROTOCOL_CATEGORY_PREFIX: Final[str] = "protocol"
+CONF_PLUGIN_KEY_SPLITTER: Final[str] = "||plugin||"
 CONF_DEFAULT_PROVIDERS_SETUP: Final[str] = "default_providers_setup"
 CONF_BACKGROUND_SCAN_CONCURRENCY: Final[str] = "background_scan_concurrency"
 
@@ -491,6 +501,9 @@ CONF_ENTRY_OUTPUT_CODEC = ConfigEntry(
 CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3 = ConfigEntry.from_dict(
     {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "default_value": "mp3"}
 )
+CONF_ENTRY_OUTPUT_CODEC_DEFAULT_AAC = ConfigEntry.from_dict(
+    {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "default_value": "aac"}
+)
 CONF_ENTRY_OUTPUT_CODEC_ENFORCE_MP3 = ConfigEntry.from_dict(
     {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "default_value": "mp3", "hidden": True}
 )
@@ -499,6 +512,18 @@ CONF_ENTRY_OUTPUT_CODEC_HIDDEN = ConfigEntry.from_dict(
 )
 CONF_ENTRY_OUTPUT_CODEC_ENFORCE_FLAC = ConfigEntry.from_dict(
     {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "default_value": "flac", "hidden": True}
+)
+
+CONF_ENTRY_PREFER_WAV_FOR_LIVE_SOURCES = ConfigEntry(
+    key=CONF_PREFER_WAV_FOR_LIVE_SOURCES,
+    type=ConfigEntryType.BOOLEAN,
+    default_value=False,
+    category="protocol_generic",
+    advanced=True,
+    requires_reload=True,
+)
+CONF_ENTRY_PREFER_WAV_FOR_LIVE_SOURCES_DEFAULT_ENABLED = ConfigEntry.from_dict(
+    {**CONF_ENTRY_PREFER_WAV_FOR_LIVE_SOURCES.to_dict(), "default_value": True}
 )
 
 
@@ -930,6 +955,7 @@ ATTR_PREVIOUS_VOLUME: Final[str] = "previous_volume"
 ATTR_LAST_POLL: Final[str] = "last_poll"
 ATTR_GROUP_MEMBERS: Final[str] = "group_members"
 ATTR_GROUP_VOLUME_SNAPSHOT: Final[str] = "group_volume_snapshot"
+ATTR_VOLUME_TARGET: Final[str] = "volume_target"
 ATTR_ENABLED: Final[str] = "enabled"
 ATTR_AVAILABLE: Final[str] = "available"
 ATTR_POWERED: Final[str] = "powered"
@@ -1016,6 +1042,13 @@ DEFAULT_PROVIDERS: Final[set[tuple[str, bool]]] = {
     ("ambient_sounds", False),
 }
 
+# Seconds an external source may sit paused before we consider its session ended.
+# Devices keep a source like Spotify Connect loaded and paused indefinitely, also once
+# the app released the speaker, and offer nothing that tells an abandoned session apart
+# from a real pause - so time is the only signal left. Kept generous because this is
+# what a real pause is given before we stop presenting the source as resumable.
+EXTERNAL_PAUSE_IDLE_TIMEOUT: Final[int] = 60
+
 EXTERNAL_SOURCES: Final[set[str]] = {
     # list of sources that are definitely considered "external"
     # values are matched case-insensitive against the player's active_source
@@ -1050,6 +1083,8 @@ EXTERNAL_SOURCES: Final[set[str]] = {
     "chromecast",
     # bluetooth (bluesound, musiccast)
     "bluetooth",
+    "bluetooth audio",
+    "bluetooth_audio",
     # physical/analog inputs (sonos, heos, musiccast, demo)
     "line-in",
     "linein",

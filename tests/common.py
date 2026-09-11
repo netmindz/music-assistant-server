@@ -5,21 +5,33 @@ import contextlib
 import inspect
 import logging
 import pathlib
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Iterator, Mapping
 from types import MethodType
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiofiles.os
-from music_assistant_models.enums import EventType, IdentifierType, PlayerFeature, PlayerType
+from music_assistant_models.enums import (
+    EventType,
+    IdentifierType,
+    PlayerFeature,
+    PlayerType,
+    ProviderType,
+)
 from music_assistant_models.player import DeviceInfo
 
-from music_assistant.controllers.config.providers import ProviderConfigMixin
+from music_assistant.constants import CONF_PROVIDERS
+from music_assistant.controllers.config import ConfigController
+from music_assistant.controllers.tasks.constants import TASK_LIFECYCLE_UPDATE_DEBOUNCE
 from music_assistant.mass import MusicAssistant
 from music_assistant.models.player import Player
 
 if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ProviderAccess
     from music_assistant_models.event import MassEvent
+
+# a role that may add and manage its own music sources; no builtin role holds the scope yet
+SELF_SERVICE_ROLE = "self_service"
 
 
 def utf8_safe(value: object) -> object:
@@ -101,13 +113,6 @@ async def wait_for_sync_completion(mass: MusicAssistant) -> AsyncGenerator[None]
             release_cb()
 
 
-# builtin providers that must not be auto-set-up during a fixture boot: local_audio
-# bridges the host machine's sound devices (built-in speakers, bluetooth, ...) as
-# sendspin players, which would leak real hardware into the player registry
-SUPPRESSED_BUILTIN_PROVIDERS = {"local_audio"}
-
-_orig_create_builtin_provider_config = ProviderConfigMixin.create_builtin_provider_config
-
 # the address a fixture's web and stream servers bind to, so a test run never listens
 # on the host's real interfaces
 LOOPBACK_IP = "127.0.0.1"
@@ -157,28 +162,40 @@ def suppress_auto_loaded_providers() -> Iterator[None]:
     Stop a fixture boot from auto-setting-up providers that reach into the host.
 
     Keeps a booted test instance isolated from the developer's machine: the default
-    device providers (airplay/chromecast/dlna/...) are not auto-configured, and neither
-    is the builtin local_audio provider, which would otherwise bridge the host's sound
-    devices (built-in speakers, bluetooth, ...) into the player registry.
+    device providers (airplay/chromecast/dlna/...) are not auto-configured.
     """
-    with (
-        patch("music_assistant.mass.DEFAULT_PROVIDERS", ()),
-        patch.object(
-            ProviderConfigMixin,
-            "create_builtin_provider_config",
-            _create_builtin_provider_config_hermetic,
-        ),
-    ):
+    with patch("music_assistant.mass.DEFAULT_PROVIDERS", ()):
         yield
 
 
-async def _create_builtin_provider_config_hermetic(
-    self: ProviderConfigMixin, provider_domain: str
-) -> None:
-    """Create builtin provider configs, skipping providers that discover host hardware."""
-    if provider_domain in SUPPRESSED_BUILTIN_PROVIDERS:
-        return
-    await _orig_create_builtin_provider_config(self, provider_domain)
+async def wait_for_boot_to_settle(mass: MusicAssistant) -> None:
+    """
+    Wait out the events a fixture boot leaves in flight.
+
+    A provider finishes loading in a detached task that registers background tasks, and
+    registering one emits a debounced task list, so without this a test can start watching
+    for events in time to catch the tail of its own fixture's boot.
+
+    :param mass: The started instance to settle.
+    """
+    for provider in mass.providers:
+        await provider.initialized.wait()
+    # twice the window: the debounce a registration already armed, plus the tail of the
+    # post-load work that runs after a provider marks itself initialized
+    await asyncio.sleep(TASK_LIFECYCLE_UPDATE_DEBOUNCE * 2)
+
+
+@contextlib.contextmanager
+def suppress_initial_library_sync() -> Iterator[None]:
+    """
+    Hold a fixture boot's music providers to their recurring library sync only.
+
+    The first sync of a freshly loaded provider otherwise runs seconds into the boot, so on
+    a loaded machine it lands in the middle of whatever test is running by then, rewriting
+    the library under it. Tests that want a sync call ``start_sync()`` themselves.
+    """
+    with patch("music_assistant.controllers.music.controller.INITIAL_SYNC_DELAY", None):
+        yield
 
 
 # Mock classes for testing
@@ -210,6 +227,43 @@ def use_real_create_task(mass: MagicMock | MusicAssistant) -> None:
     mass.create_task = MagicMock(side_effect=_create_task)  # type: ignore[method-assign]
 
 
+def set_music_source_access(
+    mass: MusicAssistant | MagicMock,
+    access_by_instance: Mapping[str, ProviderAccess | None],
+) -> None:
+    """
+    Give the server the given music sources, each carrying the given access record.
+
+    A user's set of music sources is derived from the access records on the raw provider
+    configs, so this is all a test needs to make a source visible to (or hidden from) a
+    user. Works both on a real server and on a mocked one.
+
+    :param mass: The (real or mocked) MusicAssistant instance.
+    :param access_by_instance: Access record per music source instance id; None means a
+        household source, visible to everyone.
+    """
+    raw_configs = {
+        instance_id: {
+            "type": ProviderType.MUSIC.value,
+            "domain": instance_id.split("--")[0],
+            "instance_id": instance_id,
+            "access": access.to_dict() if access else None,
+        }
+        for instance_id, access in access_by_instance.items()
+    }
+    if isinstance(mass.config, ConfigController):
+        for instance_id, raw_config in raw_configs.items():
+            mass.config.set(f"{CONF_PROVIDERS}/{instance_id}", raw_config)
+        return
+    mass.config.get = MagicMock(
+        side_effect=lambda key, default=None: (
+            raw_configs
+            if key == CONF_PROVIDERS
+            else raw_configs.get(key.removeprefix(f"{CONF_PROVIDERS}/"), default)
+        )
+    )
+
+
 def create_mock_config(name: str) -> MagicMock:
     """Create a mock player config with the given name."""
     config = MagicMock()
@@ -232,7 +286,12 @@ class MockProvider:
         self.manifest = MagicMock()
         self.manifest.name = f"Mock {domain} Provider"
         self.mass = mass or MagicMock()
+        self.dashboards = MagicMock()
         self.logger = logging.getLogger(f"test.{domain}")
+        self.unloading = False
+        # tests that let their players signal state updates fill this with the
+        # players of this provider, the way a real provider reports them
+        self.players: list[Player] = []
 
 
 class MockPlayer(Player):
